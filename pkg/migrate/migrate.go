@@ -1,0 +1,378 @@
+// Package migrate allows to perform versioned migrations in your MongoDB.
+package migrate
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/pkg/errors"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
+)
+
+type collectionSpecification struct {
+	Name string `bson:"name"`
+	Type string `bson:"type"`
+}
+
+type versionRecord struct {
+	Version     uint64    `bson:"version"`
+	Description string    `bson:"description,omitempty"`
+	Timestamp   time.Time `bson:"timestamp"`
+	Hash        string    `bson:"hash,omitempty"`
+}
+
+const defaultMigrationsCollection = "migrations"
+
+const defaultMigrationsEnabled = true
+
+const defaultMigrationsAutoRepair = true
+
+// AllAvailable used in "Up" or "Down" methods to run all available migrations.
+const AllAvailable = -1
+
+// Migrate is type for performing migrations in provided database.
+// Database versioned using dedicated collection.
+// Each migration applying ("up" and "down") adds new document to collection.
+// This document consists migration version, migration description and timestamp.
+// Current database version determined as version in latest added document (biggest "_id") from collection mentioned above.
+type Migrate struct {
+	db                   *mongo.Database
+	migrations           []Migration
+	migrationsCollection string
+	migrationsEnabled    bool
+	migrationsAutoRepair bool
+}
+
+func NewMigrate(db *mongo.Database, migrations ...Migration) *Migrate {
+	internalMigrations := make([]Migration, len(migrations))
+	copy(internalMigrations, migrations)
+	return &Migrate{
+		db:                   db,
+		migrations:           internalMigrations,
+		migrationsCollection: defaultMigrationsCollection,
+		migrationsEnabled:    defaultMigrationsEnabled,
+		migrationsAutoRepair: defaultMigrationsAutoRepair,
+	}
+}
+
+// SetMigrationsCollection replaces name of collection for storing migration information.
+// By default it is "migrations".
+func (m *Migrate) SetMigrationsCollection(name string) {
+	m.migrationsCollection = name
+}
+
+func (m *Migrate) SetMigrationsEnabled(enabled bool) {
+	m.migrationsEnabled = enabled
+}
+
+func (m *Migrate) SetMigrationsAutoRepair(enabled bool) {
+	m.migrationsAutoRepair = enabled
+}
+
+func (m *Migrate) isCollectionExist(name string) (isExist bool, err error) {
+	collections, err := m.getCollections()
+	if err != nil {
+		return false, err
+	}
+
+	for _, c := range collections {
+		if name == c.Name {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (m *Migrate) createCollectionIfNotExist(name string) error {
+	exist, err := m.isCollectionExist(name)
+	if err != nil {
+		return err
+	}
+	if exist {
+		return nil
+	}
+
+	command := bson.D{bson.E{Key: "create", Value: name}}
+	err = m.db.RunCommand(context.TODO(), command).Err()
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (m *Migrate) getCollections() (collections []collectionSpecification, err error) {
+	filter := bson.D{bson.E{Key: "type", Value: "collection"}}
+	options := options.ListCollections().SetNameOnly(true)
+
+	cursor, err := m.db.ListCollections(context.Background(), filter, options)
+	if err != nil {
+		return nil, err
+	}
+
+	if cursor != nil {
+		defer func(cursor *mongo.Cursor) {
+			curErr := cursor.Close(context.TODO())
+			if curErr != nil {
+				if err != nil {
+					err = errors.Wrapf(curErr, "migrate: get collection failed: %s", err.Error())
+				} else {
+					err = curErr
+				}
+			}
+		}(cursor)
+	}
+
+	for cursor.Next(context.TODO()) {
+		var collection collectionSpecification
+
+		err := cursor.Decode(&collection)
+		if err != nil {
+			return nil, err
+		}
+
+		collections = append(collections, collection)
+	}
+
+	if err := cursor.Err(); err != nil {
+		return nil, err
+	}
+
+	return
+}
+
+func (m *Migrate) GetVersionRecords() (vrArray []versionRecord, outputErr error) {
+	if err := m.createCollectionIfNotExist(m.migrationsCollection); err != nil {
+		return nil, err
+	}
+
+	filter := bson.D{{}}
+	sort := bson.D{bson.E{Key: "version", Value: 1}}
+	options := options.Find().SetSort(sort)
+
+	cursor, err := m.db.Collection(m.migrationsCollection).Find(context.TODO(), filter, options)
+	if err != nil {
+		return nil, err
+	}
+
+	if cursor != nil {
+		defer func(cursor *mongo.Cursor) {
+			curErr := cursor.Close(context.TODO())
+			if curErr != nil {
+				if outputErr != nil {
+					outputErr = errors.Wrapf(outputErr, "migrate: get version records failed: %s", curErr.Error())
+				} else {
+					outputErr = curErr
+				}
+			}
+		}(cursor)
+	}
+
+	var versionRecords []versionRecord
+
+	for cursor.Next(context.TODO()) {
+		var vr versionRecord
+		err := cursor.Decode(&vr)
+		if err != nil {
+			return nil, err
+		}
+		versionRecords = append(versionRecords, vr)
+	}
+	return versionRecords, nil
+}
+
+// Version returns current database version and comment.
+func (m *Migrate) Version() (uint64, string, error) {
+	if err := m.createCollectionIfNotExist(m.migrationsCollection); err != nil {
+		return 0, "", err
+	}
+
+	filter := bson.D{{}}
+	sort := bson.D{bson.E{Key: "_id", Value: -1}}
+	options := options.FindOne().SetSort(sort)
+
+	// find record with greatest id (assuming it`s latest also)
+	result := m.db.Collection(m.migrationsCollection).FindOne(context.TODO(), filter, options)
+	err := result.Err()
+	switch {
+	case err == mongo.ErrNoDocuments:
+		return 0, "", nil
+	case err != nil:
+		return 0, "", err
+	}
+
+	var rec versionRecord
+	if err := result.Decode(&rec); err != nil {
+		return 0, "", err
+	}
+
+	return rec.Version, rec.Description, nil
+}
+
+// SetVersion forcibly changes database version to provided.
+func (m *Migrate) SetVersion(version uint64, description string, hash string) error {
+	rec := versionRecord{
+		Version:     version,
+		Timestamp:   time.Now().UTC(),
+		Description: description,
+		Hash:        hash,
+	}
+
+	_, err := m.db.Collection(m.migrationsCollection).InsertOne(context.TODO(), rec)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (m *Migrate) UpdateVersion(version uint64, description string, hash string) error {
+	filter := bson.D{{
+		Key:   "version",
+		Value: version,
+	}}
+
+	update := bson.M{
+		"$set": bson.M{
+			"description": description,
+			"hash":        hash,
+			"timestamp":   time.Now().UTC(),
+		},
+	}
+
+	_, err := m.db.Collection(m.migrationsCollection).UpdateOne(context.TODO(), filter, update)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// Up performs "up" migrations to latest available version.
+// If n<=0 all "up" migrations with newer versions will be performed.
+// If n>0 only n migrations with newer version will be performed.
+func (m *Migrate) Up(n int) error {
+
+	if !m.migrationsEnabled {
+		return nil
+	}
+
+	versionRecords, err := m.GetVersionRecords()
+	if err != nil {
+		return err
+	}
+
+	if n <= 0 || n > len(m.migrations) {
+		n = len(m.migrations)
+	}
+	migrationSort(m.migrations)
+
+	for i, p := 0, 0; i < len(m.migrations) && p < n; i++ {
+		migration := m.migrations[i]
+
+		if migration.Up == nil {
+			continue
+		}
+		p++
+
+		versionRecord := m.findVersionRecord(versionRecords, &migration)
+		if versionRecord != nil {
+			// validate hash
+
+			validHash := versionRecord.Hash == migration.Hash
+
+			if validHash {
+				// the same migration is already applied on the collection
+				continue
+			}
+
+			if !m.migrationsAutoRepair {
+				return fmt.Errorf("the hash has changed for migration version %d", migration.Version)
+			} else {
+
+				// Auto Repair
+
+				if migration.Down == nil {
+					return fmt.Errorf("can not auto repair migration version %d because the down function is nil", migration.Version)
+				}
+				if err := migration.Down(m.db); err != nil {
+					return err
+				}
+				if err := migration.Up(m.db); err != nil {
+					return err
+				}
+				if err := m.UpdateVersion(migration.Version, migration.Description, migration.Hash); err != nil {
+					return err
+				}
+			}
+		} else {
+
+			// New Migration
+
+			if err := migration.Up(m.db); err != nil {
+				return err
+			}
+			if err := m.SetVersion(migration.Version, migration.Description, migration.Hash); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// Down performs "down" migration to oldest available version.
+// If n<=0 all "down" migrations with older version will be performed.
+// If n>0 only n migrations with older version will be performed.
+func (m *Migrate) Down(n int) error {
+
+	if !m.migrationsEnabled {
+		return nil
+	}
+
+	currentVersion, _, err := m.Version()
+	if err != nil {
+		return err
+	}
+	if n <= 0 || n > len(m.migrations) {
+		n = len(m.migrations)
+	}
+	migrationSort(m.migrations)
+
+	for i, p := len(m.migrations)-1, 0; i >= 0 && p < n; i-- {
+		migration := m.migrations[i]
+		if migration.Version > currentVersion || migration.Down == nil {
+			continue
+		}
+		p++
+		if err := migration.Down(m.db); err != nil {
+			return err
+		}
+
+		var prevMigration Migration
+		if i == 0 {
+			prevMigration = Migration{Version: 0}
+		} else {
+			prevMigration = m.migrations[i-1]
+		}
+		if err := m.SetVersion(prevMigration.Version, prevMigration.Description, prevMigration.Hash); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (m *Migrate) findVersionRecord(versionRecords []versionRecord, migration *Migration) *versionRecord {
+	if len(versionRecords) == 0 {
+		return nil
+	}
+	for _, vr := range versionRecords {
+		vr := vr
+		if vr.Version == migration.Version {
+			return &vr
+		}
+	}
+	return nil
+}
