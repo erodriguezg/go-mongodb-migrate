@@ -1,7 +1,7 @@
 # Versioned migrations for MongoDB for Golang 1.20
 
 [![Version](https://img.shields.io/badge/version-v1.0.0-blue.svg)](https://github.com/erodriguezg/go-mongodb-migrate/commits/tag/1.0.0) 
-[![Go version](https://img.shields.io/badge/go-v1.16-blue.svg)](https://golang.org/doc/devel/release.html#go1.20) 
+[![Go version](https://img.shields.io/badge/go-v1.20-blue.svg)](https://golang.org/doc/devel/release.html#go1.20) 
 
 Fork from: [github.com/xakep666/go-mongodb-migrate](https://github.com/xakep666/go-mongodb-migrate)
 
