@@ -1,4 +1,4 @@
-module github.com/erodriguezg/go-mongo-migrate
+module github.com/erodriguezg/go-mongodb-migrate
 
 go 1.20
 
